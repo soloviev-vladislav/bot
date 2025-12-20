@@ -91,6 +91,19 @@ class GetChatHistoryReq(BaseModel):
 
 
 # ==================== Вспомогательная функция ====================
+def extract_folder_title(folder_obj):
+    """Извлечь текстовое название папки из объекта"""
+    if not hasattr(folder_obj, 'title'):
+        return None
+    
+    title_obj = folder_obj.title
+    if hasattr(title_obj, 'text'):
+        return title_obj.text
+    elif isinstance(title_obj, str):
+        return title_obj
+    return None
+
+
 async def get_dialogs_with_folders_info(client: TelegramClient, limit: int = 50) -> List[DialogInfo]:
     """
     Получить диалоги с информацией о папках
@@ -104,10 +117,13 @@ async def get_dialogs_with_folders_info(client: TelegramClient, limit: int = 50)
             dialog_filters = getattr(dialog_filters_result, 'filters', [])
             
             for folder in dialog_filters:
-                if hasattr(folder, 'id') and hasattr(folder, 'title') and folder.title:
+                # Извлекаем текстовое название папки
+                folder_title = extract_folder_title(folder)
+                
+                if hasattr(folder, 'id') and folder_title:
                     # Сохраняем информацию о папке
                     folder_info[folder.id] = {
-                        'title': folder.title,
+                        'title': folder_title,  # Сохраняем строку, а не объект
                         'color': getattr(folder, 'color', None),
                         'pinned': getattr(folder, 'pinned', False),
                         'include_peers': [],  # Список диалогов в этой папке
@@ -415,10 +431,13 @@ async def get_all_folders(account: str):
         folders = []
         
         for folder in dialog_filters:
-            if hasattr(folder, 'id') and hasattr(folder, 'title') and folder.title:
+            # Извлекаем текстовое название папки
+            folder_title = extract_folder_title(folder)
+            
+            if hasattr(folder, 'id') and folder_title:
                 folder_info = {
                     "id": folder.id,
-                    "title": folder.title,
+                    "title": folder_title,  # Сохраняем строку, а не объект
                     "color": getattr(folder, 'color', None),
                     "pinned": getattr(folder, 'pinned', False),
                     "include_count": 0,
@@ -467,7 +486,7 @@ async def get_dialogs_by_folder(account: str, folder_id: int):
         # Находим название папки по ID
         for folder in dialog_filters:
             if hasattr(folder, 'id') and folder.id == folder_id:
-                folder_title = getattr(folder, 'title', f"Папка {folder_id}")
+                folder_title = extract_folder_title(folder)
                 break
         
         # Фильтруем диалоги по указанной папке

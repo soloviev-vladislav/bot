@@ -99,7 +99,10 @@ async def get_dialogs_with_folders_info(client: TelegramClient, limit: int = 50)
         # 1. Получаем все папки (диалоговые фильтры)
         folder_info = {}
         try:
-            dialog_filters = await client(GetDialogFiltersRequest())
+            dialog_filters_result = await client(GetDialogFiltersRequest())
+            # Получаем список папок из атрибута .filters
+            dialog_filters = getattr(dialog_filters_result, 'filters', [])
+            
             for folder in dialog_filters:
                 if hasattr(folder, 'id') and hasattr(folder, 'title') and folder.title:
                     # Сохраняем информацию о папке
@@ -406,7 +409,9 @@ async def get_all_folders(account: str):
         raise HTTPException(400, detail=f"Аккаунт не найден: {account}")
 
     try:
-        dialog_filters = await client(GetDialogFiltersRequest())
+        dialog_filters_result = await client(GetDialogFiltersRequest())
+        # Получаем список папок из атрибута .filters
+        dialog_filters = getattr(dialog_filters_result, 'filters', [])
         folders = []
         
         for folder in dialog_filters:
@@ -454,19 +459,20 @@ async def get_dialogs_by_folder(account: str, folder_id: int):
         # Получаем все диалоги с информацией о папках
         all_dialogs = await get_dialogs_with_folders_info(client, limit=200)
         
+        # Получаем информацию о папках для поиска названия
+        dialog_filters_result = await client(GetDialogFiltersRequest())
+        dialog_filters = getattr(dialog_filters_result, 'filters', [])
+        folder_title = None
+        
+        # Находим название папки по ID
+        for folder in dialog_filters:
+            if hasattr(folder, 'id') and folder.id == folder_id:
+                folder_title = getattr(folder, 'title', f"Папка {folder_id}")
+                break
+        
         # Фильтруем диалоги по указанной папке
         folder_dialogs = []
         for dialog in all_dialogs:
-            # Ищем папку по названию (для этого нужно получить информацию о папках)
-            dialog_filters = await client(GetDialogFiltersRequest())
-            folder_title = None
-            
-            # Находим название папки по ID
-            for folder in dialog_filters:
-                if hasattr(folder, 'id') and folder.id == folder_id:
-                    folder_title = getattr(folder, 'title', f"Папка {folder_id}")
-                    break
-            
             if folder_title and folder_title in dialog.folder_names:
                 folder_dialogs.append(dialog)
         

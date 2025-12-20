@@ -6,6 +6,7 @@ from telethon.sessions import StringSession
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
+from typing import List, Optional
 import uvicorn
 
 API_ID = 31407487
@@ -41,6 +42,34 @@ class AuthCodeReq(BaseModel):
 class ExportMembersReq(BaseModel):
     account: str          # имя аккаунта (сессии)
     group: str | int      # ID группы или @username
+
+# ==================== Новые модели ====================
+class DialogInfo(BaseModel):
+    id: int
+    title: str
+    username: Optional[str] = None
+    is_group: bool
+    is_channel: bool
+    is_user: bool
+    unread_count: int
+    last_message_date: Optional[str] = None
+
+class GetDialogsReq(BaseModel):
+    account: str
+    limit: int = 50
+
+class ChatMessage(BaseModel):
+    id: int
+    date: str
+    from_id: Optional[int] = None
+    text: str
+    is_outgoing: bool
+
+class GetChatHistoryReq(BaseModel):
+    account: str
+    chat_id: str | int
+    limit: int = 50
+    offset_id: Optional[int] = None
 
 
 # ==================== Общий обработчик входящих ====================
@@ -182,6 +211,91 @@ async def export_members(req: ExportMembersReq):
         }
     except Exception as e:
         raise HTTPException(500, detail=f"Ошибка экспорта: {str(e)}. Убедись, что аккаунт в группе и имеет права (для супергрупп — админ для полного экспорта).")
+
+
+# ==================== Получить список диалогов ====================
+@app.post("/dialogs")
+async def get_dialogs(req: GetDialogsReq):
+    """
+    Получить список диалогов для указанного аккаунта
+    """
+    client = ACTIVE_CLIENTS.get(req.account)
+    if not client:
+        raise HTTPException(400, detail=f"Аккаунт не найден: {req.account}")
+
+    try:
+        dialogs = await client.get_dialogs(limit=req.limit)
+        
+        dialog_list = []
+        for dialog in dialogs:
+            entity = dialog.entity
+            dialog_info = DialogInfo(
+                id=entity.id,
+                title=dialog.title or dialog.name or "Без названия",
+                username=getattr(entity, 'username', None),
+                is_group=getattr(entity, 'megagroup', False) or getattr(entity, 'gigagroup', False),
+                is_channel=getattr(entity, 'broadcast', False),
+                is_user=hasattr(entity, 'first_name'),
+                unread_count=dialog.unread_count,
+                last_message_date=dialog.date.isoformat() if dialog.date else None
+            )
+            dialog_list.append(dialog_info)
+        
+        return {
+            "status": "success",
+            "account": req.account,
+            "total_dialogs": len(dialog_list),
+            "dialogs": dialog_list
+        }
+    except Exception as e:
+        raise HTTPException(500, detail=f"Ошибка получения диалогов: {str(e)}")
+
+
+# ==================== Получить историю чата ====================
+@app.post("/chat_history")
+async def get_chat_history(req: GetChatHistoryReq):
+    """
+    Получить историю сообщений для указанного чата
+    """
+    client = ACTIVE_CLIENTS.get(req.account)
+    if not client:
+        raise HTTPException(400, detail=f"Аккаунт не найден: {req.account}")
+
+    try:
+        # Получаем сущность чата
+        chat = await client.get_entity(req.chat_id)
+        
+        # Получаем историю сообщений
+        messages = await client.get_messages(
+            chat,
+            limit=req.limit,
+            offset_id=req.offset_id
+        )
+        
+        message_list = []
+        for msg in messages:
+            # Пропускаем сервисные сообщения
+            if not hasattr(msg, 'text') or msg.message is None:
+                continue
+                
+            message = ChatMessage(
+                id=msg.id,
+                date=msg.date.isoformat() if msg.date else "",
+                from_id=getattr(msg, 'from_id', None),
+                text=msg.text or msg.message or "",
+                is_outgoing=msg.out
+            )
+            message_list.append(message)
+        
+        return {
+            "status": "success",
+            "account": req.account,
+            "chat_id": req.chat_id,
+            "total_messages": len(message_list),
+            "messages": message_list
+        }
+    except Exception as e:
+        raise HTTPException(500, detail=f"Ошибка получения истории чата: {str(e)}")
 
 
 # ==================== (Опционально) Авторизация по API ====================

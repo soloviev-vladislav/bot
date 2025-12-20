@@ -3,10 +3,11 @@ import os
 import requests
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
+from telethon.tl.types import PeerUser, PeerChannel, PeerChat
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, validator
 from contextlib import asynccontextmanager
-from typing import List, Optional
+from typing import List, Optional, Union
 import uvicorn
 
 API_ID = 31407487
@@ -64,10 +65,23 @@ class ChatMessage(BaseModel):
     from_id: Optional[int] = None
     text: str
     is_outgoing: bool
+    
+    @validator('from_id', pre=True)
+    def parse_from_id(cls, v):
+        """Парсим from_id из разных форматов"""
+        if v is None:
+            return None
+        if isinstance(v, (PeerUser, PeerChannel, PeerChat)):
+            return v.user_id if isinstance(v, PeerUser) else v.channel_id if isinstance(v, PeerChannel) else v.chat_id
+        if isinstance(v, int):
+            return v
+        if isinstance(v, str) and v.isdigit():
+            return int(v)
+        return None
 
 class GetChatHistoryReq(BaseModel):
     account: str
-    chat_id: str | int
+    chat_id: Union[str, int]
     limit: int = 50
     offset_id: Optional[int] = None
 
@@ -262,38 +276,101 @@ async def get_chat_history(req: GetChatHistoryReq):
         raise HTTPException(400, detail=f"Аккаунт не найден: {req.account}")
 
     try:
-        # Получаем сущность чата
-        chat = await client.get_entity(req.chat_id)
+        chat_id = req.chat_id
+        
+        # Обрабатываем разные форматы chat_id
+        if isinstance(chat_id, str):
+            # Убираем "@" если есть в начале
+            if chat_id.startswith('@'):
+                chat_id = chat_id[1:]
+            
+            # Если это число в строке
+            if chat_id.lstrip('-').isdigit():  # Разрешаем отрицательные числа для групп
+                chat_id = int(chat_id)
+        
+        # Получаем сущность
+        try:
+            chat = await client.get_entity(chat_id)
+        except Exception as e:
+            # Если не удалось, пробуем найти в диалогах
+            dialogs = await client.get_dialogs()
+            for dialog in dialogs:
+                if str(dialog.id) == str(chat_id) or (hasattr(dialog.entity, 'username') and dialog.entity.username == chat_id):
+                    chat = dialog.entity
+                    break
+            else:
+                raise HTTPException(400, detail=f"Не удалось найти чат: {req.chat_id}. Попробуйте использовать username или проверьте, что этот диалог есть в списке /dialogs")
         
         # Получаем историю сообщений
         messages = await client.get_messages(
             chat,
             limit=req.limit,
-            offset_id=req.offset_id
+            offset_id=req.offset_id if req.offset_id and req.offset_id > 0 else None
         )
         
         message_list = []
         for msg in messages:
-            # Пропускаем сервисные сообщения
-            if not hasattr(msg, 'text') or msg.message is None:
+            if msg is None:
                 continue
                 
+            # Получаем текст сообщения
+            text = ""
+            if hasattr(msg, 'text') and msg.text:
+                text = msg.text
+            elif hasattr(msg, 'message') and msg.message:
+                text = msg.message
+            
+            # Пропускаем пустые сообщения без медиа
+            if not text and not hasattr(msg, 'media'):
+                continue
+            
+            # Извлекаем ID отправителя
+            from_id = None
+            if hasattr(msg, 'sender_id'):
+                sender_id = msg.sender_id
+                if isinstance(sender_id, PeerUser):
+                    from_id = sender_id.user_id
+                elif isinstance(sender_id, PeerChannel):
+                    from_id = sender_id.channel_id
+                elif isinstance(sender_id, PeerChat):
+                    from_id = sender_id.chat_id
+                elif isinstance(sender_id, int):
+                    from_id = sender_id
+            
+            # Также можно попробовать получить из from_id атрибута
+            if not from_id and hasattr(msg, 'from_id'):
+                from_id = msg.from_id
+                if isinstance(from_id, (PeerUser, PeerChannel, PeerChat)):
+                    from_id = from_id.user_id if isinstance(from_id, PeerUser) else from_id.channel_id if isinstance(from_id, PeerChannel) else from_id.chat_id
+            
             message = ChatMessage(
                 id=msg.id,
                 date=msg.date.isoformat() if msg.date else "",
-                from_id=getattr(msg, 'from_id', None),
-                text=msg.text or msg.message or "",
-                is_outgoing=msg.out
+                from_id=from_id,
+                text=text,
+                is_outgoing=msg.out if hasattr(msg, 'out') else False
             )
             message_list.append(message)
+        
+        # Получаем название чата
+        chat_title = "Unknown"
+        if hasattr(chat, 'title'):
+            chat_title = chat.title
+        elif hasattr(chat, 'first_name'):
+            chat_title = chat.first_name
+            if hasattr(chat, 'last_name') and chat.last_name:
+                chat_title += f" {chat.last_name}"
         
         return {
             "status": "success",
             "account": req.account,
             "chat_id": req.chat_id,
+            "chat_title": chat_title,
             "total_messages": len(message_list),
             "messages": message_list
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(500, detail=f"Ошибка получения истории чата: {str(e)}")
 

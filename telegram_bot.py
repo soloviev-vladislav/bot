@@ -4,10 +4,12 @@ import requests
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.tl.types import PeerUser, PeerChannel, PeerChat
+from telethon.tl.functions.messages import GetDialogsRequest, GetDialogFiltersRequest
+from telethon.tl.types import InputPeerEmpty
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, validator
 from contextlib import asynccontextmanager
-from typing import List, Optional, Union
+from typing import List, Optional, Union, Dict
 import uvicorn
 
 API_ID = 31407487
@@ -49,6 +51,7 @@ class DialogInfo(BaseModel):
     id: int
     title: str
     username: Optional[str] = None
+    folder_names: List[str] = []  # Список названий папок
     is_group: bool
     is_channel: bool
     is_user: bool
@@ -58,6 +61,7 @@ class DialogInfo(BaseModel):
 class GetDialogsReq(BaseModel):
     account: str
     limit: int = 50
+    include_folders: bool = True  # Включить информацию о папках
 
 class ChatMessage(BaseModel):
     id: int
@@ -84,6 +88,126 @@ class GetChatHistoryReq(BaseModel):
     chat_id: Union[str, int]
     limit: int = 50
     offset_id: Optional[int] = None
+
+
+# ==================== Вспомогательная функция ====================
+async def get_dialogs_with_folders_info(client: TelegramClient, limit: int = 50) -> List[DialogInfo]:
+    """
+    Получить диалоги с информацией о папках
+    """
+    try:
+        # 1. Получаем все папки (диалоговые фильтры)
+        folder_info = {}
+        try:
+            dialog_filters = await client(GetDialogFiltersRequest())
+            for folder in dialog_filters:
+                if hasattr(folder, 'id') and hasattr(folder, 'title') and folder.title:
+                    # Сохраняем информацию о папке
+                    folder_info[folder.id] = {
+                        'title': folder.title,
+                        'color': getattr(folder, 'color', None),
+                        'pinned': getattr(folder, 'pinned', False),
+                        'include_peers': [],  # Список диалогов в этой папке
+                        'exclude_peers': []   # Исключенные диалоги (если есть)
+                    }
+                    
+                    # Получаем включенные диалоги для этой папки
+                    if hasattr(folder, 'include_peers'):
+                        for peer in folder.include_peers:
+                            peer_id = None
+                            if hasattr(peer, 'user_id'):
+                                peer_id = peer.user_id
+                            elif hasattr(peer, 'chat_id'):
+                                peer_id = peer.chat_id
+                            elif hasattr(peer, 'channel_id'):
+                                peer_id = peer.channel_id
+                            
+                            if peer_id:
+                                folder_info[folder.id]['include_peers'].append(peer_id)
+                    
+                    # Получаем исключенные диалоги (если есть)
+                    if hasattr(folder, 'exclude_peers'):
+                        for peer in folder.exclude_peers:
+                            peer_id = None
+                            if hasattr(peer, 'user_id'):
+                                peer_id = peer.user_id
+                            elif hasattr(peer, 'chat_id'):
+                                peer_id = peer.chat_id
+                            elif hasattr(peer, 'channel_id'):
+                                peer_id = peer.channel_id
+                            
+                            if peer_id:
+                                folder_info[folder.id]['exclude_peers'].append(peer_id)
+        except Exception as e:
+            print(f"Не удалось получить информацию о папках: {e}")
+        
+        # 2. Получаем диалоги
+        dialogs = await client.get_dialogs(limit=limit)
+        
+        # 3. Создаем маппинг ID диалога -> список названий папок
+        dialog_to_folders = {}
+        
+        # Проходим по всем папкам и заполняем маппинг
+        for folder_id, folder_data in folder_info.items():
+            for peer_id in folder_data['include_peers']:
+                if peer_id not in dialog_to_folders:
+                    dialog_to_folders[peer_id] = []
+                dialog_to_folders[peer_id].append(folder_data['title'])
+        
+        # 4. Обрабатываем диалоги
+        dialog_list = []
+        for dialog in dialogs:
+            entity = dialog.entity
+            
+            # Получаем список названий папок для этого диалога
+            folder_names = []
+            dialog_id = entity.id
+            
+            # Проверяем, есть ли диалог в каких-либо папках
+            if dialog_id in dialog_to_folders:
+                folder_names = dialog_to_folders[dialog_id]
+            
+            # Также проверяем folder_id в самом диалоге (старый метод)
+            if hasattr(dialog, 'folder_id') and dialog.folder_id and dialog.folder_id in folder_info:
+                folder_title = folder_info[dialog.folder_id]['title']
+                if folder_title not in folder_names:
+                    folder_names.append(folder_title)
+            
+            dialog_info = DialogInfo(
+                id=entity.id,
+                title=dialog.title or dialog.name or "Без названия",
+                username=getattr(entity, 'username', None),
+                folder_names=folder_names,  # Список названий папок
+                is_group=getattr(entity, 'megagroup', False) or getattr(entity, 'gigagroup', False),
+                is_channel=getattr(entity, 'broadcast', False),
+                is_user=hasattr(entity, 'first_name'),
+                unread_count=dialog.unread_count,
+                last_message_date=dialog.date.isoformat() if dialog.date else None
+            )
+            dialog_list.append(dialog_info)
+        
+        return dialog_list
+        
+    except Exception as e:
+        print(f"Ошибка при получении диалогов с папками: {e}")
+        # Возвращаем обычные диалоги без информации о папках
+        dialogs = await client.get_dialogs(limit=limit)
+        dialog_list = []
+        for dialog in dialogs:
+            entity = dialog.entity
+            dialog_info = DialogInfo(
+                id=entity.id,
+                title=dialog.title or dialog.name or "Без названия",
+                username=getattr(entity, 'username', None),
+                folder_names=[],  # Пустой список
+                is_group=getattr(entity, 'megagroup', False) or getattr(entity, 'gigagroup', False),
+                is_channel=getattr(entity, 'broadcast', False),
+                is_user=hasattr(entity, 'first_name'),
+                unread_count=dialog.unread_count,
+                last_message_date=dialog.date.isoformat() if dialog.date else None
+            )
+            dialog_list.append(dialog_info)
+        return dialog_list
 
 
 # ==================== Общий обработчик входящих ====================
@@ -169,7 +293,7 @@ async def remove_account(name: str):
     raise HTTPException(404, detail="Аккаунт не найден")
 
 
-# ==================== Список аккаунтов ====================
+# ==================== Список акалогов ====================
 @app.get("/accounts")
 def list_accounts():
     return {"active_accounts": list(ACTIVE_CLIENTS.keys())}
@@ -227,42 +351,135 @@ async def export_members(req: ExportMembersReq):
         raise HTTPException(500, detail=f"Ошибка экспорта: {str(e)}. Убедись, что аккаунт в группе и имеет права (для супергрупп — админ для полного экспорта).")
 
 
-# ==================== Получить список диалогов ====================
+# ==================== Получить список диалогов (с папками) ====================
 @app.post("/dialogs")
 async def get_dialogs(req: GetDialogsReq):
     """
-    Получить список диалогов для указанного аккаунта
+    Получить список диалогов для указанного аккаунта с информацией о папках
     """
     client = ACTIVE_CLIENTS.get(req.account)
     if not client:
         raise HTTPException(400, detail=f"Аккаунт не найден: {req.account}")
 
     try:
-        dialogs = await client.get_dialogs(limit=req.limit)
-        
-        dialog_list = []
-        for dialog in dialogs:
-            entity = dialog.entity
-            dialog_info = DialogInfo(
-                id=entity.id,
-                title=dialog.title or dialog.name or "Без названия",
-                username=getattr(entity, 'username', None),
-                is_group=getattr(entity, 'megagroup', False) or getattr(entity, 'gigagroup', False),
-                is_channel=getattr(entity, 'broadcast', False),
-                is_user=hasattr(entity, 'first_name'),
-                unread_count=dialog.unread_count,
-                last_message_date=dialog.date.isoformat() if dialog.date else None
-            )
-            dialog_list.append(dialog_info)
+        if req.include_folders:
+            # Используем новую функцию с информацией о папках
+            dialog_list = await get_dialogs_with_folders_info(client, req.limit)
+        else:
+            # Старая логика без информации о папках
+            dialogs = await client.get_dialogs(limit=req.limit)
+            dialog_list = []
+            for dialog in dialogs:
+                entity = dialog.entity
+                dialog_info = DialogInfo(
+                    id=entity.id,
+                    title=dialog.title or dialog.name or "Без названия",
+                    username=getattr(entity, 'username', None),
+                    folder_names=[],  # Пустой список
+                    is_group=getattr(entity, 'megagroup', False) or getattr(entity, 'gigagroup', False),
+                    is_channel=getattr(entity, 'broadcast', False),
+                    is_user=hasattr(entity, 'first_name'),
+                    unread_count=dialog.unread_count,
+                    last_message_date=dialog.date.isoformat() if dialog.date else None
+                )
+                dialog_list.append(dialog_info)
         
         return {
             "status": "success",
             "account": req.account,
+            "include_folders": req.include_folders,
             "total_dialogs": len(dialog_list),
             "dialogs": dialog_list
         }
     except Exception as e:
         raise HTTPException(500, detail=f"Ошибка получения диалогов: {str(e)}")
+
+
+# ==================== Получить все папки ====================
+@app.post("/folders/{account}")
+async def get_all_folders(account: str):
+    """
+    Получить список всех папок (диалоговых фильтров) для аккаунта
+    """
+    client = ACTIVE_CLIENTS.get(account)
+    if not client:
+        raise HTTPException(400, detail=f"Аккаунт не найден: {account}")
+
+    try:
+        dialog_filters = await client(GetDialogFiltersRequest())
+        folders = []
+        
+        for folder in dialog_filters:
+            if hasattr(folder, 'id') and hasattr(folder, 'title') and folder.title:
+                folder_info = {
+                    "id": folder.id,
+                    "title": folder.title,
+                    "color": getattr(folder, 'color', None),
+                    "pinned": getattr(folder, 'pinned', False),
+                    "include_count": 0,
+                    "exclude_count": 0
+                }
+                
+                # Подсчитываем включенные диалоги
+                if hasattr(folder, 'include_peers'):
+                    folder_info["include_count"] = len(folder.include_peers)
+                
+                # Подсчитываем исключенные диалоги
+                if hasattr(folder, 'exclude_peers'):
+                    folder_info["exclude_count"] = len(folder.exclude_peers)
+                
+                folders.append(folder_info)
+        
+        return {
+            "status": "success",
+            "account": account,
+            "total_folders": len(folders),
+            "folders": folders
+        }
+    except Exception as e:
+        raise HTTPException(500, detail=f"Ошибка получения папок: {str(e)}")
+
+
+# ==================== Получить диалоги по папке ====================
+@app.post("/dialogs_by_folder/{account}/{folder_id}")
+async def get_dialogs_by_folder(account: str, folder_id: int):
+    """
+    Получить диалоги из определенной папки
+    """
+    client = ACTIVE_CLIENTS.get(account)
+    if not client:
+        raise HTTPException(400, detail=f"Аккаунт не найден: {account}")
+
+    try:
+        # Получаем все диалоги с информацией о папках
+        all_dialogs = await get_dialogs_with_folders_info(client, limit=200)
+        
+        # Фильтруем диалоги по указанной папке
+        folder_dialogs = []
+        for dialog in all_dialogs:
+            # Ищем папку по названию (для этого нужно получить информацию о папках)
+            dialog_filters = await client(GetDialogFiltersRequest())
+            folder_title = None
+            
+            # Находим название папки по ID
+            for folder in dialog_filters:
+                if hasattr(folder, 'id') and folder.id == folder_id:
+                    folder_title = getattr(folder, 'title', f"Папка {folder_id}")
+                    break
+            
+            if folder_title and folder_title in dialog.folder_names:
+                folder_dialogs.append(dialog)
+        
+        return {
+            "status": "success",
+            "account": account,
+            "folder_id": folder_id,
+            "folder_title": folder_title,
+            "total_dialogs": len(folder_dialogs),
+            "dialogs": folder_dialogs
+        }
+    except Exception as e:
+        raise HTTPException(500, detail=f"Ошибка получения диалогов по папке: {str(e)}")
 
 
 # ==================== Получить историю чата ====================

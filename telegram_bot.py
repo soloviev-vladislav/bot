@@ -18,7 +18,7 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
 
 # Хранилище: имя → клиент
 ACTIVE_CLIENTS = {}
-PENDING_AUTH = {}
+PENDING_AUTH = {}  # Формат: {phone: {"session_str": "...", "phone_code_hash": "..."}}
 
 
 # ==================== Модели ====================
@@ -40,6 +40,7 @@ class AuthStartReq(BaseModel):
 class AuthCodeReq(BaseModel):
     phone: str
     code: str
+    phone_code_hash: str  # <-- ОБЯЗАТЕЛЬНО добавляем этот параметр!
     password: str | None = None
 
 class ExportMembersReq(BaseModel):
@@ -130,7 +131,7 @@ async def get_dialogs_with_folders_info(client: TelegramClient, limit: int = 50)
                         'exclude_peers': []   # Исключенные диалоги (если есть)
                     }
                     
-                    # Получаем включенные диалоги для этой папки
+                    # Получаем включенные диалоги для этой папке
                     if hasattr(folder, 'include_peers'):
                         for peer in folder.include_peers:
                             peer_id = None
@@ -209,7 +210,7 @@ async def get_dialogs_with_folders_info(client: TelegramClient, limit: int = 50)
         
     except Exception as e:
         print(f"Ошибка при получении диалогов с папками: {e}")
-        # Возвращаем обычные диалоги без информации о папках
+        # Возвращаем обычные диалоги без информации о папок
         dialogs = await client.get_dialogs(limit=limit)
         dialog_list = []
         for dialog in dialogs:
@@ -418,7 +419,7 @@ async def get_dialogs(req: GetDialogsReq):
 @app.post("/folders/{account}")
 async def get_all_folders(account: str):
     """
-    Получить список всех папок (диалоговых фильтров) для аккаунта
+    Получить список всех папок (диалоговых фильтры) для аккаунта
     """
     client = ACTIVE_CLIENTS.get(account)
     if not client:
@@ -620,26 +621,75 @@ async def get_chat_history(req: GetChatHistoryReq):
 # ==================== (Опционально) Авторизация по API ====================
 @app.post("/auth/start")
 async def auth_start(req: AuthStartReq):
+    """
+    Начать авторизацию: запросить код подтверждения
+    """
     if req.phone in PENDING_AUTH:
         raise HTTPException(400, "Авторизация уже идёт")
+    
     client = TelegramClient(StringSession(), API_ID, API_HASH)
     await client.connect()
-    await client.send_code_request(req.phone)
-    PENDING_AUTH[req.phone] = client
-    return {"status": "code_sent"}
+    
+    try:
+        # Отправляем запрос кода
+        sent_code = await client.send_code_request(req.phone)
+        
+        # Сохраняем строку сессии и phone_code_hash
+        session_str = client.session.save()
+        PENDING_AUTH[req.phone] = {
+            "session_str": session_str,
+            "phone_code_hash": sent_code.phone_code_hash
+        }
+        
+        await client.disconnect()
+        
+        return {
+            "status": "code_sent",
+            "phone": req.phone,
+            "phone_code_hash": sent_code.phone_code_hash,  # <-- ВАЖНО: возвращаем hash клиенту
+            "message": "Используйте phone_code_hash в запросе /auth/complete"
+        }
+    except Exception as e:
+        await client.disconnect()
+        raise HTTPException(400, detail=f"Ошибка при запросе кода: {str(e)}")
 
 
 @app.post("/auth/complete")
 async def auth_complete(req: AuthCodeReq):
-    client = PENDING_AUTH.get(req.phone)
-    if not client:
-        raise HTTPException(400, "Нет активной авторизации")
+    """
+    Завершить авторизацию: отправить полученный код
+    """
+    pending_data = PENDING_AUTH.get(req.phone)
+    if not pending_data:
+        raise HTTPException(400, "Нет активной авторизации для этого номера")
+    
+    # Восстанавливаем клиент из сохраненной сессии
+    client = TelegramClient(StringSession(pending_data["session_str"]), API_ID, API_HASH)
+    await client.connect()
+    
     try:
-        await client.sign_in(req.phone, req.code, password=req.password)
+        # Используем phone_code_hash из сохраненных данных
+        await client.sign_in(
+            phone=req.phone,
+            code=req.code,
+            phone_code_hash=pending_data["phone_code_hash"],  # <-- Используем сохраненный hash
+            password=req.password
+        )
+        
+        # Если успешно, получаем финальную строку сессии
         session_str = client.session.save()
+        
+        # Удаляем временные данные
         del PENDING_AUTH[req.phone]
-        return {"status": "success", "session_string": session_str}
+        await client.disconnect()
+        
+        return {
+            "status": "success",
+            "session_string": session_str,
+            "message": "Авторизация успешна. Используйте session_string в /accounts/add"
+        }
     except Exception as e:
+        await client.disconnect()
         raise HTTPException(400, detail=str(e))
 
 

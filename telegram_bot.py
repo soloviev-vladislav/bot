@@ -6,6 +6,7 @@ from telethon.sessions import StringSession
 from telethon.tl.types import PeerUser, PeerChannel, PeerChat
 from telethon.tl.functions.messages import GetDialogsRequest, GetDialogFiltersRequest
 from telethon.tl.types import InputPeerEmpty
+from telethon.errors import SessionPasswordNeededError  # Добавлен импорт
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, validator
 from contextlib import asynccontextmanager
@@ -668,13 +669,33 @@ async def auth_complete(req: AuthCodeReq):
     await client.connect()
     
     try:
-        # Используем phone_code_hash из сохраненных данных
-        await client.sign_in(
-            phone=req.phone,
-            code=req.code,
-            phone_code_hash=pending_data["phone_code_hash"],  # <-- Используем сохраненный hash
-            password=req.password
-        )
+        # Пытаемся войти с кодом
+        try:
+            await client.sign_in(
+                phone=req.phone,
+                code=req.code,
+                phone_code_hash=pending_data["phone_code_hash"]
+            )
+        except SessionPasswordNeededError:
+            # Если требуется пароль 2FA
+            if not req.password:
+                await client.disconnect()
+                raise HTTPException(400, detail="Требуется пароль двухфакторной аутентификации. Укажите параметр password.")
+            
+            # Пытаемся войти с паролем 2FA
+            try:
+                await client.sign_in(
+                    phone=req.phone,
+                    code=req.code,
+                    phone_code_hash=pending_data["phone_code_hash"],
+                    password=req.password
+                )
+            except Exception as e:
+                await client.disconnect()
+                raise HTTPException(400, detail=f"Ошибка при вводе пароля 2FA: {str(e)}")
+        except Exception as e:
+            await client.disconnect()
+            raise HTTPException(400, detail=f"Ошибка при вводе кода: {str(e)}")
         
         # Если успешно, получаем финальную строку сессии
         session_str = client.session.save()

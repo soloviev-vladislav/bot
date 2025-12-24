@@ -669,9 +669,9 @@ async def get_chat_history(req: GetChatHistoryReq):
                 continue
                 
             text = ""
-            if hasattr(msg, 'text') и msg.text:
+            if hasattr(msg, 'text') and msg.text:
                 text = msg.text
-            elif hasattr(msg, 'message') и msg.message:
+            elif hasattr(msg, 'message') and msg.message:
                 text = msg.message
             
             if not text and not hasattr(msg, 'media'):
@@ -712,3 +712,4 @@ async def get_chat_history(req: GetChatHistoryReq):
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
     uvicorn.run("telegram_bot:app", host="0.0.0.0", port=port, reload=False)
+

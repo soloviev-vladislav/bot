@@ -5,8 +5,9 @@ from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.tl.types import PeerUser, PeerChannel, PeerChat
 from telethon.tl.functions.messages import GetDialogsRequest, GetDialogFiltersRequest
-from telethon.tl.types import InputPeerEmpty
-from telethon.errors import SessionPasswordNeededError
+from telethon.tl.functions.contacts import ImportContactsRequest, DeleteContactsRequest
+from telethon.tl.types import InputPhoneContact
+from telethon.errors import SessionPasswordNeededError, FloodWaitError, PhoneNumberInvalidError, UserPrivacyRestrictedError
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, validator
 from contextlib import asynccontextmanager
@@ -94,6 +95,15 @@ class GetChatHistoryReq(BaseModel):
     chat_id: Union[str, int]
     limit: int = 50
     offset_id: Optional[int] = None
+
+# ==================== НОВАЯ МОДЕЛЬ: отправка новым пользователям ====================
+class SendToNewUserReq(BaseModel):
+    account: str
+    phone: str
+    message: str
+    first_name: str = "Contact"
+    last_name: str = ""
+    delete_after: bool = True
 
 
 # ==================== Вспомогательные функции ====================
@@ -383,6 +393,101 @@ def list_accounts():
     return {"active_accounts": list(ACTIVE_CLIENTS.keys())}
 
 
+# ==================== НОВЫЙ ЭНДПОИНТ: Отправка сообщения новому пользователю ====================
+@app.post("/send_to_new_user")
+async def send_to_new_user(req: SendToNewUserReq):
+    """
+    Отправить сообщение пользователю, которого нет в контактах.
+    Бот автоматически добавит пользователя в контакты, отправит сообщение
+    и при необходимости удалит из контактов.
+    """
+    client = ACTIVE_CLIENTS.get(req.account)
+    if not client:
+        raise HTTPException(400, detail=f"Аккаунт не найден: {req.account}")
+
+    try:
+        # 1. Добавляем пользователя в контакты
+        print(f"📇 Добавляю в контакты: {req.phone}")
+        
+        contact = InputPhoneContact(
+            client_id=0,  # 0 для автоматического ID
+            phone=req.phone,
+            first_name=req.first_name,
+            last_name=req.last_name
+        )
+        
+        result = await client(ImportContactsRequest([contact]))
+        
+        if not result.users:
+            raise HTTPException(400, detail=f"Пользователь не найден по номеру {req.phone}")
+        
+        user = result.users[0]
+        print(f"✅ Успешно добавлен! ID: {user.id}, Имя: {user.first_name}")
+        
+        # 2. Отправляем сообщение
+        print(f"📤 Отправляю сообщение пользователю {user.id}...")
+        
+        try:
+            await client.send_message(user, req.message)
+            print(f"✅ Сообщение отправлено!")
+            
+            # 3. Удаляем из контактов если требуется
+            if req.delete_after:
+                print(f"🗑️ Удаляю из контактов...")
+                await client(DeleteContactsRequest(id=[user]))
+                print(f"✅ Удалено из контактов")
+            
+            return {
+                "status": "sent",
+                "account": req.account,
+                "phone": req.phone,
+                "user_id": user.id,
+                "user_info": {
+                    "first_name": user.first_name,
+                    "last_name": user.last_name or "",
+                    "username": getattr(user, 'username', None)
+                },
+                "deleted_from_contacts": req.delete_after,
+                "message_preview": req.message[:100] + "..." if len(req.message) > 100 else req.message
+            }
+            
+        except FloodWaitError as e:
+            print(f"⏳ Ограничение Telegram: ждите {e.seconds} секунд")
+            # Удаляем пользователя из контактов, чтобы не оставлять следов
+            if not req.delete_after:
+                try:
+                    await client(DeleteContactsRequest(id=[user]))
+                except:
+                    pass
+            raise HTTPException(429, detail=f"Ограничение Telegram: ждите {e.seconds} секунд")
+            
+        except UserPrivacyRestrictedError:
+            print(f"❌ Пользователь запретил получение сообщений")
+            # Удаляем пользователя из контактов
+            if not req.delete_after:
+                try:
+                    await client(DeleteContactsRequest(id=[user]))
+                except:
+                    pass
+            raise HTTPException(403, detail="Пользователь запретил получение сообщений")
+            
+        except Exception as e:
+            print(f"❌ Ошибка отправки: {e}")
+            # Удаляем пользователя из контактов в случае ошибки
+            if not req.delete_after:
+                try:
+                    await client(DeleteContactsRequest(id=[user]))
+                except:
+                    pass
+            raise HTTPException(500, detail=f"Ошибка отправки сообщения: {str(e)}")
+            
+    except PhoneNumberInvalidError:
+        raise HTTPException(400, detail=f"Некорректный номер телефона: {req.phone}. Формат должен быть: +79991234567")
+        
+    except Exception as e:
+        raise HTTPException(500, detail=f"Ошибка обработки: {str(e)}")
+
+
 # ==================== Остальные эндпоинты (без изменений) ====================
 async def incoming_handler(event):
     if event.is_outgoing:
@@ -564,9 +669,9 @@ async def get_chat_history(req: GetChatHistoryReq):
                 continue
                 
             text = ""
-            if hasattr(msg, 'text') and msg.text:
+            if hasattr(msg, 'text') и msg.text:
                 text = msg.text
-            elif hasattr(msg, 'message') and msg.message:
+            elif hasattr(msg, 'message') и msg.message:
                 text = msg.message
             
             if not text and not hasattr(msg, 'media'):

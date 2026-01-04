@@ -13,6 +13,7 @@ from pydantic import BaseModel, validator
 from contextlib import asynccontextmanager
 from typing import List, Optional, Union, Dict
 import uvicorn
+from datetime import datetime
 
 API_ID = 31407487
 API_HASH = "0b82a91fb5c797a2bf713ad3d46a9c20"
@@ -105,6 +106,12 @@ class SendToNewUserReq(BaseModel):
     last_name: str = ""
     delete_after: bool = True
 
+# ==================== НОВАЯ МОДЕЛЬ: добавление контакта ====================
+class AddContactReq(BaseModel):
+    account: str
+    phone: str
+    first_name: str = "Contact"
+    last_name: str = ""
 
 # ==================== Вспомогательные функции ====================
 def extract_folder_title(folder_obj):
@@ -488,6 +495,99 @@ async def send_to_new_user(req: SendToNewUserReq):
         raise HTTPException(500, detail=f"Ошибка обработки: {str(e)}")
 
 
+# ==================== НОВЫЙ ЭНДПОИНТ: Добавить контакт ====================
+@app.post("/add_contact")
+async def add_contact(req: AddContactReq):
+    """
+    Добавить контакт по номеру телефона.
+    Возвращает информацию о добавленном пользователе.
+    """
+    client = ACTIVE_CLIENTS.get(req.account)
+    if not client:
+        raise HTTPException(400, detail=f"Аккаунт не найден: {req.account}")
+
+    try:
+        # 1. Добавляем пользователя в контакты
+        print(f"📇 Добавляю контакт: {req.phone}")
+        
+        contact = InputPhoneContact(
+            client_id=0,  # 0 для автоматического ID
+            phone=req.phone,
+            first_name=req.first_name,
+            last_name=req.last_name
+        )
+        
+        result = await client(ImportContactsRequest([contact]))
+        
+        if not result.users:
+            raise HTTPException(400, detail=f"Пользователь не найден по номеру {req.phone}. "
+                                         "Проверьте корректность номера и что пользователь существует в Telegram.")
+        
+        user = result.users[0]
+        print(f"✅ Контакт успешно добавлен! ID: {user.id}, Имя: {user.first_name}")
+        
+        # 2. Получаем полную информацию о пользователе
+        user_info = {
+            "id": user.id,
+            "first_name": user.first_name,
+            "last_name": user.last_name or "",
+            "username": getattr(user, 'username', None),
+            "phone": req.phone,
+            "bot": getattr(user, 'bot', False),
+            "premium": getattr(user, 'premium', False),
+            "verified": getattr(user, 'verified', False),
+            "restricted": getattr(user, 'restricted', False),
+            "scam": getattr(user, 'scam', False),
+            "access_hash": user.access_hash if hasattr(user, 'access_hash') else None
+        }
+        
+        # 3. Проверяем, есть ли у пользователя ограничения на отправку сообщений
+        can_message = True
+        try:
+            # Пробуем отправить тестовое сообщение (не отправляем на самом деле)
+            if hasattr(user, 'bot') and user.bot:
+                can_message = True
+            else:
+                # Проверяем возможность отправки сообщений через get_entity
+                await client.get_entity(user.id)
+        except UserPrivacyRestrictedError:
+            can_message = False
+        except Exception:
+            can_message = True
+        
+        return {
+            "status": "contact_added",
+            "account": req.account,
+            "phone": req.phone,
+            "contact": user_info,
+            "metadata": {
+                "can_message": can_message,
+                "in_contacts": True,
+                "date_added": datetime.now().isoformat(),
+                "imported_count": result.imported[0] if hasattr(result, 'imported') and result.imported else 1
+            },
+            "message": f"Контакт '{req.first_name} {req.last_name}' успешно добавлен"
+        }
+        
+    except PhoneNumberInvalidError:
+        raise HTTPException(400, detail=f"Некорректный номер телефона: {req.phone}. "
+                                     "Формат должен быть: +79991234567 (с кодом страны)")
+        
+    except FloodWaitError as e:
+        raise HTTPException(429, detail=f"Ограничение Telegram: подождите {e.seconds} секунд перед повторной попыткой")
+        
+    except Exception as e:
+        error_msg = str(e)
+        if "PHONE_NOT_OCCUPIED" in error_msg:
+            raise HTTPException(400, detail=f"Номер {req.phone} не зарегистрирован в Telegram")
+        elif "PHONE_NUMBER_BANNED" in error_msg:
+            raise HTTPException(400, detail=f"Номер {req.phone} заблокирован в Telegram")
+        elif "PHONE_NUMBER_FLOOD" in error_msg:
+            raise HTTPException(429, detail="Слишком много запросов добавления контактов. Подождите некоторое время.")
+        else:
+            raise HTTPException(500, detail=f"Ошибка добавления контакта: {error_msg}")
+
+
 # ==================== Остальные эндпоинты (без изменений) ====================
 async def incoming_handler(event):
     if event.is_outgoing:
@@ -712,4 +812,5 @@ async def get_chat_history(req: GetChatHistoryReq):
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
     uvicorn.run("telegram_bot:app", host="0.0.0.0", port=port, reload=False)
+
 

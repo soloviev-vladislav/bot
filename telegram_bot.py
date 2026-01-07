@@ -638,26 +638,67 @@ async def export_members(req: ExportMembersReq):
         group = await client.get_entity(req.group)
         participants = await client.get_participants(group, aggressive=True)
 
-        members = [
-            {
+        members = []
+        for p in participants:
+            # Определяем, является ли участник администратором
+            is_admin = False
+            admin_title = None
+            
+            # Проверяем разные способы определения администратора
+            if hasattr(p, 'participant'):
+                # Для участников групп/каналов
+                participant = p.participant
+                if hasattr(participant, 'admin_rights') and participant.admin_rights:
+                    is_admin = True
+                    admin_title = getattr(participant, 'rank', None) or getattr(participant, 'title', None)
+            
+            # Альтернативная проверка через права
+            if not is_admin and hasattr(p, 'admin_rights') and p.admin_rights:
+                is_admin = True
+            
+            # Собираем информацию об участнике
+            member_data = {
                 "id": p.id,
-                "username": p.username,
-                "first_name": p.first_name,
-                "last_name": p.last_name,
-                "phone": p.phone if p.phone else None,
-                "is_admin": p.admin_rights is not None,
-                "is_bot": p.bot,
+                "username": p.username if hasattr(p, 'username') and p.username else None,
+                "first_name": p.first_name if hasattr(p, 'first_name') and p.first_name else "",
+                "last_name": p.last_name if hasattr(p, 'last_name') and p.last_name else "",
+                "phone": p.phone if hasattr(p, 'phone') and p.phone else None,
+                "is_admin": is_admin,
+                "admin_title": admin_title,
+                "is_bot": p.bot if hasattr(p, 'bot') else False,
+                "is_self": p.self if hasattr(p, 'self') else False,
+                "is_contact": p.contact if hasattr(p, 'contact') else False,
+                "is_mutual_contact": p.mutual_contact if hasattr(p, 'mutual_contact') else False,
+                "is_deleted": p.deleted if hasattr(p, 'deleted') else False,
+                "is_verified": p.verified if hasattr(p, 'verified') else False,
+                "is_restricted": p.restricted if hasattr(p, 'restricted') else False,
+                "is_scam": p.scam if hasattr(p, 'scam') else False,
+                "is_fake": p.fake if hasattr(p, 'fake') else False,
+                "is_support": p.support if hasattr(p, 'support') else False,
+                "is_premium": p.premium if hasattr(p, 'premium') else False,
             }
-            for p in participants
-        ]
+            
+            # Добавляем статус (онлайн/офлайн)
+            if hasattr(p, 'status'):
+                status = p.status
+                if hasattr(status, '__class__'):
+                    member_data["status"] = status.__class__.__name__
+                    if hasattr(status, 'was_online'):
+                        member_data["last_seen"] = status.was_online.isoformat() if status.was_online else None
+            
+            members.append(member_data)
 
         return {
             "status": "exported",
             "group": req.group,
+            "group_title": group.title if hasattr(group, 'title') else "Unknown",
             "total_members": len(members),
+            "admins_count": sum(1 for m in members if m["is_admin"]),
+            "bots_count": sum(1 for m in members if m["is_bot"]),
             "members": members
         }
     except Exception as e:
+        print(f"Ошибка экспорта участников: {e}")
         raise HTTPException(500, detail=f"Ошибка экспорта: {str(e)}")
 
 
@@ -812,5 +853,6 @@ async def get_chat_history(req: GetChatHistoryReq):
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
     uvicorn.run("telegram_bot:app", host="0.0.0.0", port=port, reload=False)
+
 
 
